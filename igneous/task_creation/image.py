@@ -64,6 +64,7 @@ __all__  = [
   "create_ccl_equivalence_tasks",
   "create_ccl_relabel_tasks",
   "create_voxel_counting_tasks",
+  "create_reordering_tasks",
   "accumulate_voxel_counts",
   "compute_rois",
 ]
