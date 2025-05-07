@@ -39,7 +39,7 @@ from igneous.tasks import (
 )
 
 from igneous.shards import image_shard_shape_from_spec
-from igneous.types import ShapeType
+from igneous.types import ShapeType, DownsampleMethods
 
 from .common import (
   operator_contact, FinelyDividedTaskIterator, 
@@ -166,8 +166,11 @@ def create_touch_tasks(
 
   return TouchTaskIterator(bounds, shape)
 
-def num_mips_from_memory_target(memory_target, dtype, chunk_size, factor):
-  num_voxels = memory_target / np.dtype(dtype).itemsize
+def num_mips_from_memory_target(
+  memory_target:int, dtype, chunk_size, 
+  num_channels:int, factor
+) -> int:
+  num_voxels = memory_target / np.dtype(dtype).itemsize / num_channels
   num_chunks = num_voxels // reduce(operator.mul, chunk_size)
 
   total_factor = reduce(operator.mul, factor)
@@ -207,6 +210,8 @@ def create_downsampling_tasks(
   bounds_mip:int = 0,
   memory_target:int = MEMORY_TARGET,
   encoding_level:Optional[int] = None,
+  encoding_effort:Optional[int] = None,
+  method:int = DownsampleMethods.AUTO,
 ):
   """
   Creates a set of unsharded downsampling tasks and inserts them into the queue.
@@ -248,7 +253,7 @@ def create_downsampling_tasks(
       factor = downsample_scales.axis_to_factor(axis)
 
     viable_mips = num_mips_from_memory_target(
-      memory_target, vol.dtype, shape, factor
+      memory_target, vol.dtype, shape, vol.num_channels, factor
     )
 
     if num_mips is None:
@@ -276,7 +281,7 @@ def create_downsampling_tasks(
   )
 
   for mip_i in range(mip+1, min(mip + num_mips, len(vol.available_mips))):
-    set_encoding(vol, mip_i, encoding, encoding_level)
+    set_encoding(vol, mip_i, encoding, encoding_level, encoding_effort)
   vol.commit_info()
 
   if not preserve_chunk_size or chunk_size:
@@ -304,6 +309,7 @@ def create_downsampling_tasks(
         compress=compress,
         factor=factor,
         max_mips=num_mips,
+        method=method,
       )
 
     def on_finish(self):
@@ -320,12 +326,15 @@ def create_downsampling_tasks(
           'chunk_size': (list(chunk_size) if chunk_size else None),
           'preserve_chunk_size': preserve_chunk_size,
           'encoding': encoding,
+          'encoding_level': encoding_level,
+          'encoding_effort': encoding_effort,
           'fill_missing': bool(fill_missing),
           'delete_black_uploads': bool(delete_black_uploads),
           'background_color': background_color,
           'dest_path': dest_path,
           'compress': compress,
           'factor': (tuple(factor) if factor else None),
+          'method': method,
         },
         'by': operator_contact(),
         'date': strftime('%Y-%m-%d %H:%M %Z'),
@@ -388,10 +397,14 @@ def create_sharded_image_info(
   """
   if isinstance(dtype, int):
     byte_width = dtype
-  elif isinstance(dtype, str) or np.issubdtype(dtype, np.integer):
+  elif (
+    isinstance(dtype, str) 
+    or np.issubdtype(dtype, np.integer) 
+    or np.issubdtype(dtype, np.floating)
+  ):
     byte_width = np.dtype(dtype).itemsize
   else:
-    raise ValueError(f"{dtype} must be int, str, or np.integer.")
+    raise ValueError(f"{dtype} must be int, str, np.integer, or np.floating.")
 
   voxels = prod(dataset_size)
   chunk_voxels = prod(chunk_size)
@@ -400,14 +413,6 @@ def create_sharded_image_info(
   # maximum amount of information in the morton codes
   grid_size = np.ceil(Vec(*dataset_size) / Vec(*chunk_size)).astype(np.int64)
   max_bits = sum([ math.ceil(math.log2(size)) for size in grid_size ])
-  if max_bits > 64:
-    raise ValueError(
-      f"{max_bits}, more than a 64-bit integer, "
-      "would be required to describe the chunk positions "
-      "in this dataset. Try increasing the chunk size or "
-      "increasing dataset bounds."
-      f"Dataset Size: {dataset_size} Chunk Size: {chunk_size}"
-    )
 
   chunks_per_shard = math.ceil(uncompressed_shard_bytesize / (chunk_voxels * byte_width))
   chunks_per_shard = 2 ** int(math.log2(chunks_per_shard))
@@ -417,7 +422,7 @@ def create_sharded_image_info(
 
   # approximate, would need to account for rounding effects to be exact
   # rounding is corrected for via max_bits - pre - mini below.
-  num_shards = num_chunks / chunks_per_shard 
+  num_shards = num_chunks / chunks_per_shard
   
   def update_bits():
     shard_bits = int(math.ceil(math.log2(num_shards)))
@@ -459,7 +464,25 @@ def create_sharded_image_info(
   # in the morton codes, so if there's any slack from rounding, the
   # remainder goes into shard bits.
   preshift_bits = preshift_bits - minishard_bits
-  shard_bits = max_bits - preshift_bits - minishard_bits
+  if dataset_size[2] == chunk_size[2]:
+    additional_bits = (preshift_bits // 3)
+    i = 0
+    while i < additional_bits:
+      max_bits += 1
+      preshift_bits += 1
+      if preshift_bits % 3 != 0:
+        i += 1
+
+  shard_bits = max(max_bits - preshift_bits - minishard_bits, 0)
+
+  if max_bits > 64:
+    raise ValueError(
+      f"{max_bits}, more than a 64-bit integer, "
+      "would be required to describe the chunk positions "
+      "in this dataset. Try increasing the chunk size or "
+      "increasing dataset bounds."
+      f"Dataset Size: {dataset_size} Chunk Size: {chunk_size}"
+    )
 
   if preshift_bits < 0:
     raise ValueError(f"Preshift bits cannot be negative. ({shard_bits}, {minishard_bits}, {preshift_bits}), total info: {max_bits} bits")
@@ -467,7 +490,7 @@ def create_sharded_image_info(
   if preshift_bits + shard_bits + minishard_bits > max_bits:
     raise ValueError(f"{preshift_bits} preshift_bits {shard_bits} shard_bits + {minishard_bits} minishard_bits must be <= {max_bits}. Try reducing the number of minishards.")
 
-  if encoding in ("jpeg", "png", "kempressed", "fpzip", "zfpc"):
+  if encoding in ("jpeg", "jpegxl", "jxl", "png", "kempressed", "fpzip", "zfpc"):
     data_encoding = "raw"
 
   return {
@@ -501,6 +524,7 @@ def create_image_shard_transfer_tasks(
   cutout:bool = False,
   minishard_index_encoding:str = "gzip",
   stop_layer:Optional[int] = None,
+  encoding_effort:Optional[int] = None,
 ):
   src_vol = CloudVolume(src_layer_path, mip=mip)
 
@@ -515,7 +539,7 @@ def create_image_shard_transfer_tasks(
     src_vol, dst_layer_path, 
     dest_voxel_offset, 
     mip, bounds_mip,
-    encoding, encoding_level,
+    encoding, encoding_level, encoding_effort,
     chunk_size, truncate_scales,
     clean_info, cutout, bounds
   )
@@ -583,6 +607,8 @@ def create_image_shard_transfer_tasks(
           "mip": mip,
           "encoding_level": encoding_level,
           "stop_layer": stop_layer,
+          "encoding_effort": encoding_effort,
+          "timestamp": timestamp,
         },
         "by": operator_contact(),
         "date": strftime("%Y-%m-%d %H:%M %Z"),
@@ -602,6 +628,8 @@ def create_image_shard_downsample_tasks(
   agglomerate=False, timestamp=None,
   factor=(2,2,1), bounds=None, bounds_mip=0,
   encoding_level:Optional[int] = None,
+  encoding_effort:Optional[int] = None,
+  method=DownsampleMethods.AUTO,
 ):
   """
   Downsamples an existing image layer that may be
@@ -622,7 +650,7 @@ def create_image_shard_downsample_tasks(
     dtype=cv.dtype,
     uncompressed_shard_bytesize=int(memory_target),
   )
-  set_encoding(cv, mip + 1, encoding, encoding_level)
+  set_encoding(cv, mip + 1, encoding, encoding_level, encoding_effort)
   cv.commit_info()
 
   shape = image_shard_shape_from_spec(
@@ -649,6 +677,7 @@ def create_image_shard_downsample_tasks(
         agglomerate=bool(agglomerate),
         timestamp=timestamp,
         factor=tuple(factor),
+        method=method,
       )
 
     def on_finish(self):
@@ -663,6 +692,9 @@ def create_image_shard_downsample_tasks(
           "mip": mip,
           "agglomerate": agglomerate,
           "timestamp": timestamp,
+          "method": method,
+          "encoding_level": encoding_level,
+          "encoding_effort": encoding_effort,
         },
         "by": operator_contact(),
         "date": strftime("%Y-%m-%d %H:%M %Z"),
@@ -728,7 +760,7 @@ def create_transfer_cloudvolume(
   src_vol:CloudVolume, dst_cloudpath:str, 
   dest_voxel_offset:ShapeType, 
   mip:int, bounds_mip:int,
-  encoding:str, encoding_level:int,
+  encoding:str, encoding_level:int, encoding_effort:Optional[int],
   chunk_size:ShapeType, 
   truncate_scales:bool, clean_info:bool,
   cutout:bool, bounds:Bbox
@@ -765,7 +797,7 @@ def create_transfer_cloudvolume(
         (dest_voxel_offset + bounds.minpt) * (bounds_resolution / dest_vol.meta.resolution(i))
       )
 
-  set_encoding(dest_vol, mip, encoding, encoding_level)
+  set_encoding(dest_vol, mip, encoding, encoding_level, encoding_effort)
   if truncate_scales:
     dest_vol.info['scales'] = dest_vol.info['scales'][:mip+1]
   dest_vol.info['scales'][mip]['chunk_sizes'] = [ chunk_size.tolist() ]
@@ -803,6 +835,8 @@ def create_transfer_tasks(
   truncate_scales:bool = True,
   cutout:bool = False,
   stop_layer:Optional[int] = None,
+  downsample_method:int = DownsampleMethods.AUTO,
+  encoding_effort:Optional[int] = None,
 ) -> Iterator:
   """
   Transfer data to a new data layer. You can use this operation
@@ -840,10 +874,12 @@ def create_transfer_tasks(
     image type-specific first stage of compression and the "compress" flag as the data
     agnostic second stage compressor. For example, compressed_segmentation and gzip work
     well together, but not jpeg and gzip.
-  encoding_level: Some encoding schemes (png,jpeg,fpzip) offer a simple scalar knob
+  encoding_level: Some encoding schemes (png,jpeg,jpegxl,fpzip,zfpc) offer a simple scalar knob
     to control encoding quality. This number corresponds to png level, jpeg quality,
     and fpzip precision. Other schemes might require more complex inputs and may
     require info file modifications.
+  encoding_effort: (jpeg xl only) Sets JPEG XL effort to hit the specified quality target. 
+    Higher values are slower, but more reliable.
   factor: (overrides axis) can manually specify what each downsampling round is
     supposed to do: e.g. (2,2,1), (2,2,2), etc
   fill_missing: Treat missing image tiles as zeroed for both src and dest.
@@ -899,7 +935,7 @@ def create_transfer_tasks(
     src_vol, dest_layer_path, 
     dest_voxel_offset, 
     mip, bounds_mip,
-    encoding, encoding_level,
+    encoding, encoding_level, encoding_effort,
     chunk_size, truncate_scales,
     clean_info, cutout, bounds
   )
@@ -967,6 +1003,7 @@ def create_transfer_tasks(
         factor=factor,
         sparse=sparse,
         stop_layer=stop_layer,
+        downsample_method=int(downsample_method),
       )
 
     def on_finish(self):
@@ -994,7 +1031,9 @@ def create_transfer_tasks(
           'factor': (tuple(factor) if factor else None),
           'sparse': bool(sparse),
           'encoding_level': encoding_level,
+          'encoding_effort': encoding_effort,
           'stop_layer': stop_layer,
+          'downsample_method': int(downsample_method),
         },
         'by': operator_contact(),
         'date': strftime('%Y-%m-%d %H:%M %Z'),
@@ -1042,6 +1081,7 @@ def create_reordering_tasks(
   background_color:int = 0,
   encoding:Optional[str] = None, 
   encoding_level:Optional[int] = None,
+  encoding_effort:Optional[int] = None,
 ):
   src_cv = CloudVolume(src, mip=mip)
   zstart, zend = src_cv.bounds.min[2], src_cv.bounds.max[2]
@@ -1058,7 +1098,11 @@ def create_reordering_tasks(
   dest_cv.info['scales'][mip]['chunk_sizes'] = [ chunk_size ]
   dest_cv.info = clean_xfer_info(dest_cv.info)
   if encoding:
-    set_encoding(dest_cv, mip, encoding, encoding_level=encoding_level)
+    set_encoding(
+      dest_cv, mip, encoding,
+      encoding_level=encoding_level, 
+      encoding_effort=encoding_effort,
+    )
 
   dest_cv.commit_info()
 
@@ -1109,6 +1153,7 @@ def create_reordering_tasks(
           # 'factor': (tuple(factor) if factor else None),
           # 'sparse': bool(sparse),
           'encoding_level': encoding_level,
+          'encoding_effort': encoding_effort,
         },
         'by': operator_contact(),
         'date': strftime('%Y-%m-%d %H:%M %Z'),
@@ -1718,7 +1763,8 @@ def create_voxel_counting_tasks(
 
 def accumulate_voxel_counts(
   cloudpath, mip, 
-  progress=True, compress=None
+  progress=True, compress=None,
+  additional_output:Optional[str] = None,
 ):
   """
   Accumulate counts from each task.
@@ -1757,10 +1803,17 @@ def accumulate_voxel_counts(
   cf = CloudFiles(final_path)
   im = IntMap(final_counts)
 
+  binary = im.tobytes()
+  del im
   del final_counts
+
+  if additional_output:
+    with open(additional_output, "wb") as f:
+      f.write(binary)
+
   cf.put(
     'voxel_counts.im', 
-    im.tobytes(),
+    binary,
     content_type="application/x-intmap",
     compress=compress,
   )

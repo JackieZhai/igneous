@@ -53,7 +53,7 @@ __all__ = [
 # split the work up into ~1000 tasks (magnitude 3)
 def create_mesh_manifest_tasks(layer_path, magnitude=3, mesh_dir=None):
   assert int(magnitude) == magnitude
-  assert magnitude >= 0
+  assert magnitude > 0
 
   protocol = cloudfiles.paths.get_protocol(layer_path)
   if protocol == "file":
@@ -64,8 +64,8 @@ def create_mesh_manifest_tasks(layer_path, magnitude=3, mesh_dir=None):
       )
     ]
 
-  start = 10 ** (magnitude - 1)
-  end = 10 ** magnitude
+  start = int(10 ** (magnitude - 1))
+  end = int(10 ** magnitude)
 
   class MeshManifestTaskIterator(object):
     def __len__(self):
@@ -161,14 +161,20 @@ def create_meshing_tasks(
     mesh_dir=None, cdn_cache=False, dust_threshold=None,
     object_ids=None, progress=False, fill_missing=False,
     encoding='precomputed', spatial_index=True, frag_path=None, sharded=False,
-    compress='gzip', closed_dataset_edges=True, dust_global=False
+    compress='gzip', closed_dataset_edges=True, dust_global=False,
+    fill_holes=0, dry_run=False,
   ):
   shape = Vec(*shape)
+
+  assert 0 <= fill_holes <= 3, "fill_holes must be between 0 to 3 inclusive."
 
   vol = CloudVolume(layer_path, mip)
 
   if mesh_dir is None:
-    mesh_dir = 'mesh_mip_{}_err_{}'.format(mip, max_simplification_error)
+    if 'mesh' in vol.info:
+      mesh_dir = vol.info['mesh']
+    else:
+      mesh_dir = 'mesh_mip_{}_err_{}'.format(mip, max_simplification_error)
 
   if not 'mesh' in vol.info:
     vol.info['mesh'] = mesh_dir
@@ -209,6 +215,8 @@ def create_meshing_tasks(
         sharded=sharded,
         compress=compress,
         closed_dataset_edges=closed_dataset_edges,
+        fill_holes=fill_holes,
+        dry_run=dry_run,
       )
 
     def on_finish(self):
@@ -232,6 +240,8 @@ def create_meshing_tasks(
           'compress': compress,
           'closed_dataset_edges': closed_dataset_edges,
           'dust_global': bool(dust_global),
+          'fill_holes': int(fill_holes),
+          'dry_run': bool(dry_run),
         },
         'by': operator_contact(),
         'date': strftime('%Y-%m-%d %H:%M %Z'),
@@ -464,6 +474,7 @@ def create_unsharded_multires_mesh_tasks(
   """
   # split the work up into ~1000 tasks (magnitude 3)
   assert int(magnitude) == magnitude
+  assert magnitude > 0
 
   configure_multires_info(
     cloudpath, 
@@ -471,8 +482,8 @@ def create_unsharded_multires_mesh_tasks(
     mesh_dir
   )
 
-  start = 10 ** (magnitude - 1)
-  end = 10 ** magnitude
+  start = int(10 ** (magnitude - 1))
+  end = int(10 ** magnitude)
 
   class UnshardedMultiResTaskIterator:
     def __len__(self):

@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 
+from functools import partial
 import json
 import math
 import os
@@ -25,18 +26,39 @@ import tinybrain
 
 import igneous.shards
 from igneous import downsample_scales
-from igneous.types import ShapeType
+from igneous.types import ShapeType, DownsampleMethods
 
 from .obsolete import (
   HyperSquareConsensusTask, WatershedRemapTask,
   MaskAffinitymapTask, InferenceTask
 )
 
+def downsample_method_to_fn(method, sparse, vol):
+  if method == DownsampleMethods.AUTO:
+    if vol.layer_type == 'image':
+      method = DownsampleMethods.AVERAGE_POOLING
+    elif vol.layer_type == 'segmentation':
+      method = DownsampleMethods.MODE_POOLING
+    else:
+      method = DownsampleMethods.STRIDING
+
+  if method == DownsampleMethods.MIN_POOLING:
+    return tinybrain.downsample_with_min_pooling
+  elif method == DownsampleMethods.MAX_POOLING:
+    return tinybrain.downsample_with_max_pooling
+  elif method == DownsampleMethods.AVERAGE_POOLING:
+    return partial(tinybrain.downsample_with_averaging, sparse=sparse)
+  elif method == DownsampleMethods.MODE_POOLING:
+    return partial(tinybrain.downsample_segmentation, sparse=sparse)
+  else:
+    return tinybrain.downsample_with_striding
+
 def downsample_and_upload(
-    image, bounds, vol, ds_shape,
-    mip=0, axis='z', skip_first=False,
-    sparse=False, factor=None, max_mips=None
-  ):
+  image, bounds, vol, ds_shape,
+  mip=0, axis='z', skip_first=False,
+  sparse=False, factor=None, max_mips=None,
+  method=DownsampleMethods.AUTO,
+):
     ds_shape = min2(vol.volume_size, ds_shape[:3])
     underlying_mip = (mip + 1) if (mip + 1) in vol.available_mips else mip
     chunk_size = vol.meta.chunk_size(underlying_mip).astype(np.float32)
@@ -48,7 +70,7 @@ def downsample_and_upload(
     if max_mips is not None:
       factors = factors[:max_mips]
 
-    if len(factors) == 0:
+    if len(factors) == 0 and max_mips:
       print("No factors generated. Image Shape: {}, Downsample Shape: {}, Volume Shape: {}, Bounds: {}".format(
           image.shape, ds_shape, vol.volume_size, bounds)
       )
@@ -63,19 +85,10 @@ def downsample_and_upload(
     num_mips = len(factors)
 
     mips = []
-    if vol.layer_type == 'image':
-      mips = tinybrain.downsample_with_averaging(
-        image, factors[0], 
-        num_mips=num_mips, sparse=sparse
-      )
-    elif vol.layer_type == 'segmentation':
-      mips = tinybrain.downsample_segmentation(
-        image, factors[0],
-        num_mips=num_mips, sparse=sparse
-      )
-    else:
-      mips = tinybrain.downsample_with_striding(image, factors[0], num_mips=num_mips)
 
+    fn = downsample_method_to_fn(method, sparse, vol)
+    mips = fn(image, factors[0], num_mips=num_mips)
+        
     new_bounds = bounds.clone()
 
     for factor3 in factors:
@@ -314,6 +327,9 @@ class LuminanceLevelsTask(RegisteredTask):
       cts = np.bincount(img2d)
       levels[0:len(cts)] += cts.astype(np.uint64)
 
+    if len(bboxes) == 0:
+      return
+
     covered_area = sum([bbx.volume() for bbx in bboxes])
 
     bboxes = [(bbox.volume(), bbox.size3()) for bbox in bboxes]
@@ -363,7 +379,8 @@ class LuminanceLevelsTask(RegisteredTask):
       patch_start += self.offset
       bbox = Bbox(patch_start, patch_start + sample_shape.size3())
       bbox = Bbox.clamp(bbox, dataset_bounds)
-      bboxes.append(bbox)
+      if not bbox.subvoxel():
+        bboxes.append(bbox)
     return bboxes
 
 @queueable
@@ -384,6 +401,7 @@ def TransferTask(
   factor=None,
   max_mips:Optional[int] = None,
   stop_layer:Optional[int] = None,
+  downsample_method:str = DownsampleMethods.AUTO,
 ):
   """
   Transfer an image to a new location while enabling
@@ -445,6 +463,7 @@ def TransferTask(
       skip_first=skip_first,
       sparse=sparse, axis=axis,
       factor=factor, max_mips=max_mips,
+      method=downsample_method,
     )
 
 @queueable
@@ -453,7 +472,7 @@ def DownsampleTask(
   fill_missing=False, axis='z', sparse=False,
   delete_black_uploads=False, background_color=0,
   dest_path=None, compress="gzip", factor=None,
-  max_mips=None,
+  max_mips=None, method=DownsampleMethods.AUTO,
 ):
   """
   Downsamples a cutout of the volume. By default it performs
@@ -477,6 +496,7 @@ def DownsampleTask(
     compress=compress,
     factor=factor,
     max_mips=max_mips,
+    downsample_method=DownsampleMethods.AUTO,
   )
 
 @queueable
@@ -608,7 +628,8 @@ def ImageShardDownsampleTask(
   sparse: bool = False,
   agglomerate: bool = False,
   timestamp: Optional[int] = None,
-  factor: ShapeType = (2,2,1)
+  factor: ShapeType = (2,2,1),
+  method: int = DownsampleMethods.AUTO,
 ):
   """
   Generate a single downsample level for a shard.
@@ -656,12 +677,11 @@ def ImageShardDownsampleTask(
   output_img = np.zeros(shard_shape, dtype=src_vol.dtype, order="F")
   nz = int(math.ceil(bbox.dz / (chunk_size.z * factor[2])))
 
-  dsfn = tinybrain.downsample_with_averaging
-  if src_vol.layer_type == "segmentation":
-    dsfn = tinybrain.downsample_segmentation
+  dsfn = downsample_method_to_fn(method, sparse, src_vol)
 
   zbox = bbox.clone()
-  zbox.maxpt.z = zbox.minpt.z + (chunk_size.z * factor[2])
+  z_thickness = chunk_size.z * factor[2]
+  zbox.maxpt.z = zbox.minpt.z + z_thickness
   for z in range(nz):
     img = src_vol.download(
       zbox, agglomerate=agglomerate, timestamp=timestamp
@@ -676,8 +696,8 @@ def ImageShardDownsampleTask(
 
     del img
     del ds_img
-    zbox.minpt.z += chunk_size.z
-    zbox.maxpt.z += chunk_size.z
+    zbox.minpt.z += z_thickness
+    zbox.maxpt.z += z_thickness
 
   (filename, shard) = src_vol.image.make_shard(
     output_img, shape_bbox, (mip + 1), progress=False

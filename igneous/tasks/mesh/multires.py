@@ -7,7 +7,6 @@ import itertools
 import json
 import math
 import os
-import pickle
 import random
 import re
 import struct
@@ -17,7 +16,7 @@ from tqdm import tqdm
 
 from cloudfiles import CloudFiles, CloudFile
 
-from cloudvolume import CloudVolume, Mesh, view, paths
+from cloudvolume import CloudVolume, Mesh, paths
 from cloudvolume.lib import Vec, Bbox, jsonify, sip, toiter, first
 from cloudvolume.datasource.precomputed.mesh.multilod \
   import MultiLevelPrecomputedMeshManifest, to_stored_model_space
@@ -393,7 +392,6 @@ def collect_mesh_fragments(
   def process_shardfile(item):
     filename, content = item
     fragment = MapBuffer(content, frombytesfn=Mesh.from_precomputed)
-    fragment.validate()
 
     for label in labels:
       try:

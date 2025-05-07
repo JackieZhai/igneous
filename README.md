@@ -82,6 +82,8 @@ This procedure is more robust as tasks can be restarted if they fail. The queue 
 
 This mode is very new, so please report any issues. You can read about the queue design [here](https://github.com/seung-lab/python-task-queue/wiki/FileQueue-Design). In particular, we expect you may see problems with NFS or other filesystems that have problems with networked file locking. However, purely local use should generally be issue free. You can read more tips on using FileQueue [here](https://github.com/seung-lab/python-task-queue#notes-on-file-queue). You can remove a FileQueue by deleting its containing directory.
 
+Note that the command line tool `ptq` ("Python Task Queue") is co-installed with Igneous and can be used to monitor queue status using e.g. `ptq status $QUEUENAME`.
+
 #### Producer Script
 
 ```python
@@ -456,7 +458,7 @@ tasks = create_meshing_tasks(             # First Pass
 tasks = create_mesh_manifest_tasks(layer_path, magnitude=3) # Second Pass
 ```
 
-The parameters above are mostly self explainatory, but the magnitude parameter of `create_mesh_manifest_tasks` is a bit odd. What a MeshManifestTask does is iterate through a proportion of the files defined by a filename prefix. `magnitude` splits up the work by 
+The parameters above are mostly self explanatory, but the magnitude parameter of `create_mesh_manifest_tasks` is a bit odd. What a MeshManifestTask does is iterate through a proportion of the files defined by a filename prefix. `magnitude` splits up the work by
 an additional 10^magnitude. A high magnitude (3-5+) is appropriate for horizontal scaling workloads while small magnitudes 
 (1-2) are more suited for small volumes locally processed since there is overhead introduced by splitting up the work.  
 
@@ -513,8 +515,6 @@ tasks = tc.create_skeletonizing_tasks(
     dust_threshold=1000, # Don't skeletonize below this physical distance
     progress=False, # Show a progress bar
     parallel=1, # Number of parallel processes to use (more useful locally)
-    spatial_index=True, # generate a spatial index for querying skeletons by bounding box
-    sharded=False, # generate intermediate shard fragments for later processing into sharded format
     cross_sectional_area=False, # Compute the cross sectional area for each vertex.
     cross_sectional_area_smoothing_window=5, # Rolling average of vertices.
   )

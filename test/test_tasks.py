@@ -8,7 +8,7 @@ import os.path
 import shutil
 
 import numpy as np
-from cloudvolume import CloudVolume, EmptyVolumeException, view
+from cloudvolume import CloudVolume, EmptyVolumeException
 import cloudvolume.lib as lib
 from cloudfiles import CloudFiles
 import fastremap
@@ -555,7 +555,13 @@ def test_voxel_counting_task():
     tq = MockTaskQueue()
     tasks = tc.create_voxel_counting_tasks(layer_path, mip=0)
     tq.insert_all(tasks)
-    tc.accumulate_voxel_counts(layer_path, mip=0)
+
+    additional_path = os.path.join(directory, "voxel_counts_additional.im")
+
+    tc.accumulate_voxel_counts(
+        layer_path, mip=0,
+        additional_output=additional_path,
+    )
 
     from mapbuffer import IntMap
     im = CloudFiles(layer_path).get(f"{cv.key}/stats/voxel_counts.im")
@@ -567,6 +573,13 @@ def test_voxel_counting_task():
 
     assert cts_dict_task == cts_dict_gt
 
+    with open(additional_path, "rb") as f:
+        im = IntMap(f)
+
+    cts_dict_task = im.todict()
+    assert cts_dict_task == cts_dict_gt
+
+    os.remove(additional_path)
 
 def test_num_mips_from_memory_target():
     from igneous.task_creation.image import num_mips_from_memory_target
@@ -574,48 +587,49 @@ def test_num_mips_from_memory_target():
     memory = 0
     chunk_size = (128,128,64)
     factor = (2,2,1)
+    num_channels = 1
 
-    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, factor)
+    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, num_channels, factor)
     assert num_mips == 1
 
     memory = 100e6
-    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, factor)
+    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, num_channels, factor)
     assert num_mips == 3
 
     memory = 100e6
-    num_mips = num_mips_from_memory_target(memory, 'uint16', chunk_size, factor)
+    num_mips = num_mips_from_memory_target(memory, 'uint16', chunk_size, num_channels, factor)
     assert num_mips == 2
 
     memory = 100e6
-    num_mips = num_mips_from_memory_target(memory, 'uint32', chunk_size, factor)
+    num_mips = num_mips_from_memory_target(memory, 'uint32', chunk_size, num_channels, factor)
     assert num_mips == 2
 
     memory = 100e6
-    num_mips = num_mips_from_memory_target(memory, 'uint64', chunk_size, factor)
+    num_mips = num_mips_from_memory_target(memory, 'uint64', chunk_size, num_channels, factor)
     assert num_mips == 1
 
     memory = 3.5e9
-    num_mips = num_mips_from_memory_target(memory, 'uint64', chunk_size, factor)
+    num_mips = num_mips_from_memory_target(memory, 'uint64', chunk_size, num_channels, factor)
     assert num_mips == 4
 
     memory = 12e9
-    num_mips = num_mips_from_memory_target(memory, 'uint64', chunk_size, factor)
+    num_mips = num_mips_from_memory_target(memory, 'uint64', chunk_size, num_channels, factor)
     assert num_mips == 5
 
     factor = (2,2,2)
 
     memory = 800e6
-    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, factor)
+    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, num_channels, factor)
     assert num_mips == 3
 
     memory = 500e6
-    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, factor)
+    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, num_channels, factor)
     assert num_mips == 2
 
     memory = 100e6
-    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, factor)
+    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, num_channels, factor)
     assert num_mips == 2
 
     memory = 50e6
-    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, factor)
+    num_mips = num_mips_from_memory_target(memory, 'uint8', chunk_size, num_channels, factor)
     assert num_mips == 1

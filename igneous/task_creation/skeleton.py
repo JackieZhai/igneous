@@ -1,8 +1,9 @@
 from collections import defaultdict
 import copy
+import itertools
 from functools import reduce, partial
 import re
-from typing import Any, Dict, Tuple, cast, Optional, Iterator, Union
+from typing import Any, Dict, Tuple, cast, Optional, List, Iterator, Sequence, Union
 
 from time import strftime
 
@@ -14,12 +15,13 @@ import shardcomputer
 from cloudvolume import CloudVolume
 from cloudvolume.lib import Vec, Bbox, max2, min2, xyzrange, find_closest_divisor, yellow, jsonify
 from cloudvolume.datasource.precomputed.sharding import ShardingSpecification
-from cloudfiles import CloudFiles
+from cloudfiles import CloudFiles, CloudFile
 
 from igneous.tasks import ( 
   SkeletonTask, UnshardedSkeletonMergeTask, 
   ShardedSkeletonMergeTask, DeleteSkeletonFilesTask,
-  ShardedFromUnshardedSkeletonMergeTask, SpatialIndexTask
+  ShardedFromUnshardedSkeletonMergeTask, SpatialIndexTask,
+  TransferSkeletonFilesTask
 )
 
 from .common import (
@@ -38,20 +40,47 @@ __all__ = [
   "create_spatial_index_skeleton_tasks",
 ]
 
+def bounds_from_mesh(
+  vol:CloudVolume, 
+  shape:Sequence[int], 
+  labels:List[int],
+) -> Bbox:
+  """Estimate the bounding box of a label from its mesh if available."""
+  bbxes = []
+  for label in labels:
+    try:
+      mesh = vol.mesh.get(label)
+    except ValueError:
+      raise ValueError(f"Mesh {label} is not available.")
+
+    if isinstance(mesh, dict):
+      mesh = mesh[label]
+
+    bounds = Bbox.from_points(mesh.vertices // vol.resolution)
+    bounds.grow(1)
+    bounds = bounds.expand_to_chunk_size(shape, offset=vol.voxel_offset)
+    bbxes.append(bounds)
+
+  bounds = Bbox.expand(*bbxes)
+  bounds = bounds.expand_to_chunk_size(shape, offset=vol.voxel_offset)
+  return Bbox.clamp(bounds, vol.bounds)
+
 def create_skeletonizing_tasks(
     cloudpath, mip, 
     shape=Vec(512, 512, 512),
     teasar_params={'scale':10, 'const': 10}, 
     info=None, object_ids=None, mask_ids=None,
     fix_branching=True, fix_borders=True, 
-    fix_avocados=False, fill_holes=False,
+    fix_avocados=False, fill_holes=0,
     dust_threshold=1000, progress=False,
     parallel=1, fill_missing=False, 
     sharded=False, frag_path=None, spatial_index=True,
     synapses=None, num_synapses=None,
-    dust_global=False, 
+    dust_global=False, fix_autapses=False,
     cross_sectional_area=False,
     cross_sectional_area_smoothing_window=5,
+    timestamp=None,
+    root_ids_cloudpath=None,
   ):
   """
   Assign tasks with one voxel overlap in a regular grid 
@@ -66,7 +95,7 @@ def create_skeletonizing_tasks(
   WARNING: If you are processing hundreds of millions of labels or more and
   are using Cloud Storage this can get expensive ($8 per million labels typically
   accounting for fragment generation and postprocessing)! This scale is when 
-  the experimental sharded format generator becomes crucial to use.
+  the sharded format generator becomes crucial to use.
 
   cloudpath: cloudvolume path
   mip: which mip level to skeletonize 
@@ -99,6 +128,17 @@ def create_skeletonizing_tasks(
   fix_borders: Allows trivial merging of single overlap tasks. You'll only
     want to set this to false if you're working on single or non-overlapping
     volumes.
+  fix_autapses: Only possible for graphene volumes. Uses PyChunkGraph (PCG) information
+    to fix autapses (when a neuron synapses onto itself). This requires splitting
+    contacts between the edges of two touching voxels. The algorithm for doing this
+    requires much more memory.
+
+    This works by comparing the PYC L2 and root layers. L1 is watershed. L2 is the
+    connections only within an atomic chunk. The root layer provides the global
+    connectivity. Autapses can be distinguished at the L2 level, above that, they
+    may not be (and certainly not at the root level). We extract the voxel connectivity
+    graph from L2 and perform the overall trace at root connectivity.
+
   dust_threshold: don't skeletonize labels smaller than this number of voxels
     as seen by a single task.
   dust_global: Use global voxel counts for the dust threshold instead of from
@@ -133,13 +173,34 @@ def create_skeletonizing_tasks(
   to the total computation.)
   cross_sectional_area_smoothing_window: Perform a rolling average of the 
     normal vectors across these many vectors.
+  timestamp: for graphene volumes only, you can specify the timepoint to use
+  root_ids_cloudpath: for graphene volumes, if you have a materialized archive
+    if your desired timepoint, you can use this path for fetching root ID 
+    segmentation as it is far more efficient.
+  fill_holes (int): fills holes in labels
+    0: off
+    1: simple hole filling
+    2: also fill borders in 2d on sides of image
+    3: also perform a morphological closing using 3x3x3 stencil
   """
+  assert 0 <= fill_holes <= 3, "fill_holes must be between 0 to 3 inclusive."
+
   shape = Vec(*shape)
   vol = CloudVolume(cloudpath, mip=mip, info=info)
 
+  if fix_autapses:
+    if vol.meta.path.format != "graphene":
+      raise ValueError("fix_autapses can only be performed on graphene volumes.")
+
+    if not np.all(shape % vol.meta.graph_chunk_size == 0):
+      raise ValueError(
+        f"shape must be a multiple of the graph chunk size. Got: {shape}, "
+        f"{vol.meta.graph_chunk_size}"
+      )
+
   if dust_threshold > 0 and dust_global:
     cf = CloudFiles(cloudpath)
-    vxctfile = cf.join(vol.key, 'stats', 'voxel_counts.mb')
+    vxctfile = cf.join(vol.key, 'stats', 'voxel_counts.im')
     if not cf.exists(vxctfile):
       raise FileNotFoundError(
         f"To use global dust thresholds, you must pre-compute the global voxel"
@@ -179,8 +240,31 @@ def create_skeletonizing_tasks(
 
   vol.skeleton.meta.commit_info()
 
+  if frag_path:
+    frag_info_path = CloudFiles(frag_path).join(frag_path, "info")
+    frag_info = CloudFile(frag_info_path).get_json()
+    if not frag_info:
+      CloudFile(frag_info_path).put_json(vol.skeleton.meta.info)
+    elif 'scales' in frag_info:
+      frag_info_path = CloudFiles(frag_path).join(frag_path, vol.info["skeletons"], "info")
+      CloudFile(frag_info_path).put_json(vol.skeleton.meta.info)
+
   will_postprocess = bool(np.any(vol.bounds.size3() > shape))
   bounds = vol.bounds.clone()
+
+  # this should probably be a cloudvolume feature:
+  # estimate the bounding box of an object using whatever
+  # is available: meshes, skeletons, spatial index, etc
+  if (
+    vol.info.get("mesh", None) 
+    and object_ids is not None
+    and hasattr(object_ids, "__len__") 
+    and len(object_ids) < 5
+  ):
+    try:
+      bounds = bounds_from_mesh(vol, shape, object_ids)
+    except ValueError: # if one of the meshes is None, then we can't make assumptions
+      pass
 
   class SkeletonTaskIterator(FinelyDividedTaskIterator):
     def task(self, shape, offset):
@@ -211,8 +295,12 @@ def create_skeletonizing_tasks(
         spatial_grid_shape=shape.clone(), # used for writing index filenames
         synapses=bbox_synapses,
         dust_global=dust_global,
+        fix_autapses=bool(fix_autapses),
+        timestamp=timestamp,
         cross_sectional_area=bool(cross_sectional_area),
         cross_sectional_area_smoothing_window=int(cross_sectional_area_smoothing_window),
+        root_ids_cloudpath=root_ids_cloudpath,
+        fill_holes=fill_holes,
       )
 
     def synapses_for_bbox(self, shape, offset):
@@ -256,8 +344,12 @@ def create_skeletonizing_tasks(
           'spatial_index': bool(spatial_index),
           'synapses': bool(synapses),
           'dust_global': bool(dust_global),
+          'fix_autapses': bool(fix_autapses),
+          'timestamp': timestamp,
           'cross_sectional_area': bool(cross_sectional_area),
           'cross_sectional_area_smoothing_window': int(cross_sectional_area_smoothing_window),
+          'root_ids_cloudpath': root_ids_cloudpath,
+          'fill_holes': int(fill_holes)
         },
         'by': operator_contact(),
         'date': strftime('%Y-%m-%d %H:%M %Z'),

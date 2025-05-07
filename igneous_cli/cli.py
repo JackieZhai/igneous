@@ -11,7 +11,9 @@ import webbrowser
 
 import click
 from cloudvolume import CloudVolume, Bbox
-from cloudvolume.lib import max2
+from cloudvolume.lib import max2, jsonify
+import cloudvolume.paths
+
 from cloudfiles import CloudFiles
 import cloudfiles.paths
 import numpy as np
@@ -23,6 +25,7 @@ from tqdm import tqdm
 from igneous import task_creation as tc
 from igneous import downsample_scales
 from igneous.secrets import LEASE_SECONDS, SQS_REGION_NAME
+from igneous.types import DownsampleMethods
 
 from igneous_cli.humanbytes import format_bytes
 
@@ -41,12 +44,15 @@ def normalize_encoding(encoding):
     return "crackle"
   elif encoding == "cpso":
     return "compresso"
+  elif encoding == "jpegxl":
+    return "jxl"
   elif encoding == "auto":
     return None
 
   return encoding
 
-ENCODING_HELP = "Which image encoding to use. Options: [all] raw, png; [images] jpeg; [segmentations] compressed_segmentation (cseg), compresso (cpso), crackle (ckl); [floats] fpzip, kempressed, zfpc"
+ENCODING_HELP = "Which image encoding to use. Options: [all] raw, png; [images] jpeg, jpegxl (jxl); [segmentations] compressed_segmentation (cseg), compresso (cpso), crackle (ckl); [floats] fpzip, kempressed, zfpc"
+ENCODING_EFFORT = 5
 
 def enqueue_tasks(ctx, queue, tasks):
   parallel = int(ctx.obj.get("parallel", 1))
@@ -59,12 +65,12 @@ def enqueue_tasks(ctx, queue, tasks):
     tq.insert(tasks, parallel=parallel)
   return tq
 
-class TupleN(click.ParamType):
+class ListN(click.ParamType):
   """A command line option type consisting of 3 comma-separated integers."""
-  name = 'tupleN'
+  name = 'ListN'
   def convert(self, value, param, ctx):
     if isinstance(value, str):
-      value = tuple(map(int, value.split(',')))
+      value = list(map(int, value.split(',')))
     return value
 
 class Tuple34(click.ParamType):
@@ -123,18 +129,39 @@ class CloudPath(click.ParamType):
   def convert(self, value, param, ctx):
     return cloudfiles.paths.normalize(value)
 
+class DownsampleMethodType(click.ParamType):
+  name = "DownsampleMethod"
+  def convert(self, value, param, ctx):
+    if value == "auto":
+      return DownsampleMethods.AUTO
+    elif value == "avg":
+      return DownsampleMethods.AVERAGE_POOLING
+    elif value == "mode":
+      return DownsampleMethods.MODE_POOLING
+    elif value == "min":
+      return DownsampleMethods.MIN_POOLING
+    elif value == "max":
+      return DownsampleMethods.MAX_POOLING
+    elif value == "striding":
+      return DownsampleMethods.STRIDING
+    else:
+      raise ValueError(f"Downsample method {value} not supported.")
+
 def compute_bounds(path, mip, xrange, yrange, zrange):
   bounds = None
   if xrange or yrange or zrange:
     bounds = CloudVolume(path).meta.bounds(mip)
 
   if xrange:
+    xrange = sorted(xrange)
     bounds.minpt.x = xrange[0]
     bounds.maxpt.x = xrange[1]
   if yrange:
+    yrange = sorted(yrange)
     bounds.minpt.y = yrange[0]
     bounds.maxpt.y = yrange[1]
   if zrange:
+    zrange = sorted(zrange)
     bounds.minpt.z = zrange[0]
     bounds.maxpt.z = zrange[1]
 
@@ -143,7 +170,7 @@ def compute_bounds(path, mip, xrange, yrange, zrange):
 
 @click.group()
 @click.option("-p", "--parallel", default=1, help="Run with this number of parallel processes. If 0, use number of cores.")
-@click.version_option(version="4.22.1")
+@click.version_option(version="4.28.3")
 @click.pass_context
 def main(ctx, parallel):
   """
@@ -199,25 +226,27 @@ def imagegroup():
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.")
 @click.option('--num-mips', default=None, type=int, help="Build this many additional pyramid levels. Each increment increases memory requirements per task 4-8x.")
 @click.option('--encoding', type=EncodingType(), default="auto", help=ENCODING_HELP, show_default=True)
-@click.option('--encoding-level', default=None, help="For some encodings (png level,jpeg quality,fpzip precision) a simple scalar value can adjust the compression efficiency.", show_default=True)
+@click.option('--encoding-level', default=None, help="For some encodings (png level, jpeg & jpeg xl quality, fpzip precision) a simple scalar value can adjust the compression efficiency.", show_default=True)
+@click.option('--encoding-effort', default=ENCODING_EFFORT, help="(JPEG XL) Set effort (1-10) used by JPEG XL to hit the quality target.", show_default=True)
 @click.option('--sparse', is_flag=True, default=False, help="Don't count black pixels in mode or average calculations. For images, eliminates edge ghosting in 2x2x2 downsample. For segmentation, prevents small objects from disappearing at high mip levels.")
 @click.option('--chunk-size', type=Tuple3(), default=None, help="Chunk size of new layers. e.g. 128,128,64")
-@click.option('--compress', default=None, help="Set the image compression scheme. Options: 'gzip', 'br'")
+@click.option('--compress', default=None, help="Set the image compression scheme. Options: 'none', 'gzip', 'br'")
 @click.option('--volumetric', is_flag=True, default=False, help="Use 2x2x2 downsampling.")
 @click.option('--delete-bg', is_flag=True, default=False, help="Issue a delete instead of uploading a background tile. This is helpful on systems that don't like tiny files.")
 @click.option('--bg-color', default=0, help="Determines which color is regarded as background. Default: 0")
 @click.option('--sharded', is_flag=True, default=False, help="Generate sharded downsamples which reduces the number of files.")
 @click.option('--memory', default=3.5e9, type=int, help="(sharded only) Task memory limit in bytes. Task shape will be chosen to fit and maximize downsamples.", show_default=True)
+@click.option('--method', default="auto", type=DownsampleMethodType(), help="Select the downsample method type. Options: auto, avg, mode, min, max, striding", show_default=True)
 @click.option('--xrange', type=Tuple2(), default=None, help="If specified, set x-bounds for downsampling in terms of selected mip. By default the whole dataset is selected. The bounds must be chunk aligned to the task size (maybe mysterious... use igneous design to investigate). e.g. 0,1024.", show_default=True)
 @click.option('--yrange', type=Tuple2(), default=None, help="If specified, set y-bounds for downsampling in terms of selected mip. By default the whole dataset is selected. The bounds must be chunk aligned to the task size (maybe mysterious... use igneous design to investigate). e.g. 0,1024", show_default=True)
 @click.option('--zrange', type=Tuple2(), default=None, help="If specified, set z-bounds for downsampling in terms of selected mip. By default the whole dataset is selected. The bounds must be chunk aligned to the task size (maybe mysterious... use igneous design to investigate). e.g. 0,1", show_default=True)
 @click.pass_context
 def downsample(
   ctx, path, queue, mip, fill_missing, 
-  num_mips, encoding, encoding_level, sparse, 
-  chunk_size, compress, volumetric,
+  num_mips, encoding, encoding_level, encoding_effort, 
+  sparse, chunk_size, compress, volumetric,
   delete_bg, bg_color, sharded, memory,
-  xrange, yrange, zrange, 
+  xrange, yrange, zrange, method,
 ):
   """
   Create an image pyramid for grayscale or labeled images.
@@ -242,6 +271,12 @@ def downsample(
   if volumetric:
   	factor = (2,2,2)
 
+  if compress and compress.lower() in ("none", "false"):
+    compress = False
+
+  if encoding and encoding.lower() in ("jpeg", "png", "fpzip", "zfpc"):
+    compress = False
+
   bounds = compute_bounds(path, mip, xrange, yrange, zrange)
 
   if sharded:
@@ -250,7 +285,8 @@ def downsample(
       sparse=sparse, chunk_size=chunk_size,
       encoding=encoding, memory_target=memory,
       factor=factor, bounds=bounds, bounds_mip=mip,
-      encoding_level=encoding_level,
+      encoding_level=encoding_level, method=method,
+      encoding_effort=encoding_effort,
     )
   else:
     tasks = tc.create_downsampling_tasks(
@@ -264,6 +300,8 @@ def downsample(
       bounds_mip=mip,
       memory_target=memory,
       encoding_level=encoding_level,
+      method=method,
+      encoding_effort=encoding_effort,
     )
 
   enqueue_tasks(ctx, queue, tasks)
@@ -279,7 +317,8 @@ def downsample(
 @click.option('--memory', default=3.5e9, type=int, help="Task memory limit in bytes. Task shape will be chosen to fit and maximize downsamples.", show_default=True)
 @click.option('--max-mips', default=5, help="Maximum number of additional pyramid levels.", show_default=True)
 @click.option('--encoding', type=EncodingType(), default="auto", help=ENCODING_HELP, show_default=True)
-@click.option('--encoding-level', default=None, help="For some encodings (png level,jpeg quality,fpzip precision) a simple scalar value can adjust the compression efficiency.", show_default=True)
+@click.option('--encoding-level', default=None, help="For some encodings (png level,jpeg & jpegxl quality,fpzip precision) a simple scalar value can adjust the compression efficiency.", show_default=True)
+@click.option('--encoding-effort', default=ENCODING_EFFORT, help="(JPEG XL) Set effort (1-10) used by JPEG XL to hit the quality target.", show_default=True)
 @click.option('--sparse', is_flag=True, default=False, help="Don't count black pixels in mode or average calculations. For images, eliminates edge ghosting in 2x2x2 downsample. For segmentation, prevents small objects from disappearing at high mip levels.", show_default=True)
 @click.option('--shape', type=Tuple3(), default=None, help="(overrides --memory) Set the task shape in voxels. This also determines how many downsamples you get. e.g. 2048,2048,64", show_default=True)
 @click.option('--chunk-size', type=Tuple3(), default=None, help="Chunk size of destination layer. e.g. 128,128,64", show_default=True)
@@ -297,16 +336,19 @@ def downsample(
 @click.option('--zrange', type=Tuple2(), default=None, help="If specified, set z-bounds for sampling in terms of selected bounds mip. By default the whole dataset is selected. The bounds must be chunk aligned to the task size e.g. 0,1", show_default=True)
 @click.option('--bounds-mip', default=None, type=int, help="Which mip level are xrange, yrange, and zrange specified in?", show_default=True)
 @click.option('--cutout', is_flag=True, default=False, help="If bounds are specified and creating a new volume, restrict the new volume to the specified bounds.", show_default=True)
+@click.option('--downsample-method', default="auto", type=DownsampleMethodType(), help="Select the downsample method type. Options: auto, avg, mode, min, max, striding", show_default=True)
 @click.pass_context
 def xfer(
 	ctx, src, dest, queue, translate, 
   downsample, mip, fill_missing, 
   memory, max_mips, shape, sparse, 
-  encoding, encoding_level, chunk_size, compress,
+  encoding, encoding_level, encoding_effort,
+  chunk_size, compress,
   volumetric, delete_bg, bg_color, sharded,
   dest_voxel_offset, clean_info, no_src_update,
   truncate_scales, 
-  xrange, yrange, zrange, bounds_mip, cutout
+  xrange, yrange, zrange, bounds_mip, cutout, 
+  downsample_method
 ):
   """
   Copy, re-encode, or shard an image layer.
@@ -333,7 +375,7 @@ def xfer(
   if compress and compress.lower() in ("none", "false"):
     compress = False
 
-  if encoding and encoding.lower() in ("jpeg", "png"):
+  if encoding and encoding.lower() in ("jpeg", "png", "jxl"):
     compress = False
 
   if bounds_mip is None:
@@ -348,7 +390,7 @@ def xfer(
       encoding=encoding, memory_target=memory, clean_info=clean_info,
       encoding_level=encoding_level, truncate_scales=truncate_scales,
       compress=compress, bounds=bounds, bounds_mip=bounds_mip,
-      cutout=cutout,
+      cutout=cutout, encoding_effort=encoding_effort,
     )
   else:
     tasks = tc.create_transfer_tasks(
@@ -362,6 +404,7 @@ def xfer(
       clean_info=clean_info, no_src_update=no_src_update,
       encoding_level=encoding_level, truncate_scales=truncate_scales,
       bounds=bounds, bounds_mip=bounds_mip, cutout=cutout,
+      downsample_method=downsample_method, encoding_effort=encoding_effort,
     )
 
   enqueue_tasks(ctx, queue, tasks)
@@ -393,16 +436,17 @@ def image_roi(src, progress, suppress_faint, dust, z_step, max_axial_len):
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.")
 @click.option('--encoding', type=EncodingType(), default="auto", help=ENCODING_HELP, show_default=True)
 @click.option('--encoding-level', default=None, help="For some encodings (png level,jpeg quality,fpzip precision) a simple scalar value can adjust the compression efficiency.", show_default=True)
+@click.option('--encoding-effort', default=ENCODING_EFFORT, help="(JPEG XL) Set effort (1-10) used by JPEG XL to hit the quality target.", show_default=True)
 @click.option('--compress', default="br", help="Set the image compression scheme. Options: 'none', 'gzip', 'br'", show_default=True)
 @click.option('--delete-bg', is_flag=True, default=False, help="Issue a delete instead of uploading a background tile. This is helpful on systems that don't like tiny files.")
 @click.option('--bg-color', default=0, help="Determines which color is regarded as background.", show_default=True)
-@click.option('--mapping-file', required=True, help="JSON filename containing a sparse mapping of each moved z to its new position. e.g. '\{ \"5\": 6 \}'")
+@click.option('--mapping-file', required=True, help="JSON filename containing a sparse mapping of each moved z to its new position. e.g. '{ \"5\": 6 }'")
 @click.pass_context
 def image_reorder(
   ctx, src, dest, 
   queue, mip,
   fill_missing, 
-  encoding, encoding_level,
+  encoding, encoding_level, encoding_effort,
   compress, 
   delete_bg, bg_color,
   clean_info, 
@@ -439,6 +483,7 @@ def image_reorder(
     background_color=bg_color,
     encoding=encoding, 
     encoding_level=encoding_level,
+    encoding_effort=encoding_effort,
   )
 
   enqueue_tasks(ctx, queue, tasks)
@@ -466,16 +511,20 @@ def count_voxels(ctx, path, mip, queue):
 @voxelgroup.command("sum")
 @click.argument("path", type=CloudPath())
 @click.option('--mip', default=0, help="Count this mip level of the image pyramid.", show_default=True)
-@click.option('--compress', default=None, help="", show_default=True)
+@click.option('--compress', default="zstd", help="What compression algorithm to apply. These files can be pretty big and must be downloaded by workers.", show_default=True)
+@click.option('-o', '--output', default=None, help="Also output the result as an IntMap file locally at this path. This is an additional output to avoid needing to re-download the result.", show_default=True)
 @click.pass_context
-def sum_voxel_counts(ctx, path, mip, compress):
+def sum_voxel_counts(ctx, path, mip, compress, output):
   """Accumulate counts from each task.
 
   Results are saved in a mapbuffer IntMap file:
   $cloudpath/$KEY/stats/voxel_counts.im
   """
   tc.accumulate_voxel_counts(
-    path, mip=mip, compress=compress
+    path, 
+    mip=mip, 
+    compress=compress, 
+    additional_output=output,
   )
 
 @imagegroup.group("contrast")
@@ -584,8 +633,8 @@ def cclgroup():
 @click.option('--shape', default="512,512,512", type=Tuple3(), help="Size of individual tasks in voxels.", show_default=True)
 @click.option('--mip', default=0, help="Apply to this level of the image pyramid.", show_default=True)
 @click.option('--queue', default=None, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue")
-@click.option('--threshold-gte', default=None, help="Threshold source image using image >= value.", show_default=True)
-@click.option('--threshold-lte', default=None, help="Threshold source image using image <= value.", show_default=True)
+@click.option('--threshold-gte', default=None, type=int, help="Threshold source image using image >= value.", show_default=True)
+@click.option('--threshold-lte', default=None, type=int, help="Threshold source image using image <= value.", show_default=True)
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.", show_default=True)
 @click.option('--dust', default=0, help="Delete objects smaller than this number of voxels within a cutout.", show_default=True)
 @click.pass_context
@@ -610,8 +659,8 @@ def ccl_faces(
 @click.option('--shape', default="512,512,512", type=Tuple3(), help="Size of individual tasks in voxels.", show_default=True)
 @click.option('--mip', default=0, help="Apply to this level of the image pyramid.", show_default=True)
 @click.option('--queue', default=None, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue")
-@click.option('--threshold-gte', default=None, help="Threshold source image using image >= value.", show_default=True)
-@click.option('--threshold-lte', default=None, help="Threshold source image using image <= value.", show_default=True)
+@click.option('--threshold-gte', default=None, type=int, help="Threshold source image using image >= value.", show_default=True)
+@click.option('--threshold-lte', default=None, type=int, help="Threshold source image using image <= value.", show_default=True)
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.", show_default=True)
 @click.option('--dust', default=0, help="Delete objects smaller than this number of voxels within a cutout.", show_default=True)
 @click.pass_context
@@ -649,8 +698,8 @@ def ccl_calc_labels(ctx, src, mip, shape):
 @click.option('--chunk-size', type=Tuple3(), default=None, help="Chunk size of destination layer. e.g. 128,128,64")
 @click.option('--encoding', type=EncodingType(), default="compresso", help="Which image encoding to use. Options: raw, cseg, compresso, crackle", show_default=True)
 @click.option('--queue', default=None, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue")
-@click.option('--threshold-gte', default=None, help="Threshold source image using image >= value.", show_default=True)
-@click.option('--threshold-lte', default=None, help="Threshold source image using image <= value.", show_default=True)
+@click.option('--threshold-gte', default=None, type=int, help="Threshold source image using image >= value.", show_default=True)
+@click.option('--threshold-lte', default=None, type=int, help="Threshold source image using image <= value.", show_default=True)
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.", show_default=True)
 @click.option('--dust', default=0, help="Delete objects smaller than this number of voxels within a cutout.", show_default=True)
 @click.pass_context
@@ -691,8 +740,8 @@ def ccl_clean(src, mip):
 @click.option('--encoding', default="compresso", help="Which image encoding to use. Options: raw, cseg, compresso, crackle", show_default=True)
 @click.option('--queue', default=None, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue")
 @click.option('--clean/--no-clean', default=True, is_flag=True, help="Delete intermediate files on completion.", show_default=True)
-@click.option('--threshold-gte', default=None, help="Threshold source image using image >= value.", show_default=True)
-@click.option('--threshold-lte', default=None, help="Threshold source image using image <= value.", show_default=True)
+@click.option('--threshold-gte', default=None, type=int, help="Threshold source image using image >= value.", show_default=True)
+@click.option('--threshold-lte', default=None, type=int, help="Threshold source image using image <= value.", show_default=True)
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.", show_default=True)
 @click.option('--dust', default=0, help="Delete objects smaller than this number of voxels within a cutout.", show_default=True)
 @click.pass_context
@@ -719,7 +768,7 @@ def ccl_auto(
   )
   enqueue_tasks(ctx, queue, tasks)
   if queue:
-    parallel_execute_helper(parallel, args)
+    parallel_execute_helper(parallel, args + (len(tasks),))
 
   tasks = tc.create_ccl_equivalence_tasks(
     src, mip, shape,
@@ -730,7 +779,7 @@ def ccl_auto(
   )
   enqueue_tasks(ctx, queue, tasks)
   if queue:
-    parallel_execute_helper(parallel, args)
+    parallel_execute_helper(parallel, args + (len(tasks),))
 
   import igneous.tasks.image.ccl
   igneous.tasks.image.ccl.create_relabeling(src, mip, shape)
@@ -746,10 +795,62 @@ def ccl_auto(
   )
   enqueue_tasks(ctx, queue, tasks)
   if queue:
-    parallel_execute_helper(parallel, args)
+    parallel_execute_helper(parallel, args + (len(tasks),))
 
   if clean:
     igneous.tasks.image.ccl.clean_intermediate_files(src, mip)
+
+def is_empty(tq, sqs_sec_to_wait=120):
+  start_time = time.time()
+  last_empty = False
+
+  # Offical Amazon docs state that to determine if a queue is empty,
+  # you have to test whether it's consistently empty for several 
+  # minutes. So we pick 120 seconds to wait somewhat arbitrarily.
+  # https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/confirm-queue-is-empty.html
+  def _is_empty():
+    nonlocal start_time
+    nonlocal sqs_sec_to_wait
+    nonlocal last_empty
+
+    if tq.path.protocol == "sqs":
+      if tq.is_empty():
+        if last_empty:
+          elapsed_time = time.time() - start_time
+          if elapsed_time >= sqs_sec_to_wait:
+            return True
+          else:
+            return False
+        else:
+          print(f"Queue appearently empty. Waiting {sqs_sec_to_wait} sec. to confirm.")
+          start_time = time.time()
+          last_empty = True
+          return False
+      else:
+        last_empty = False
+        return False
+    else:
+      return tq.is_empty()
+
+  return _is_empty
+
+@main.command()
+@click.argument("queue", type=str)
+@click.option('--aws-region', default=SQS_REGION_NAME, help=f"AWS region in which the SQS queue resides.", show_default=True)
+@click.option('--rate', default=30.0, help=f"Number of seconds between each poll of the queue.", show_default=True)
+@click.pass_context
+def wait(ctx, queue, aws_region, rate):
+  """Wait for a queue to empty without executing tasks.
+
+  This can be useful for filling a queue and then waiting
+  for a cluster to finish processing before loading the next
+  set of tasks in a script.
+  """
+  tq = TaskQueue(normalize_path(queue), region_name=aws_region)
+  empty_fn = is_empty(tq)
+
+  while not empty_fn():
+    time.sleep(rate)
 
 @main.command()
 @click.argument("queue", type=str)
@@ -818,40 +919,10 @@ def execute_helper(
 ):
   tq = TaskQueue(normalize_path(queue), region_name=aws_region)
 
-  sqs_sec_to_wait = 120
-  start_time = time.time()
-  last_empty = False
-
-  # Offical Amazon docs state that to determine if a queue is empty,
-  # you have to test whether it's consistently empty for several 
-  # minutes. So we pick 120 seconds to wait somewhat arbitrarily.
-  # https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/confirm-queue-is-empty.html
-  def is_empty():
-    nonlocal start_time
-    nonlocal sqs_sec_to_wait
-    nonlocal last_empty
-
-    if tq.path.protocol == "sqs":
-      if tq.is_empty():
-        if last_empty:
-          elapsed_time = time.time() - start_time
-          if elapsed_time >= sqs_sec_to_wait:
-            return True
-          else:
-            return False
-        else:
-          print(f"Queue appearently empty. Waiting {sqs_sec_to_wait} sec. to confirm.")
-          start_time = time.time()
-          last_empty = True
-          return False
-      else:
-        last_empty = False
-        return False
-    else:
-      return tq.is_empty()
+  empty_fn = is_empty(tq)
 
   def stop_after_elapsed_time(tries, executed, elapsed_time):
-    if exit_on_empty and is_empty():
+    if exit_on_empty and empty_fn():
       return True
 
     if num_tasks >= 0 and executed >= num_tasks:
@@ -887,7 +958,7 @@ def meshgroup():
 @meshgroup.command("xfer")
 @click.argument("src", type=CloudPath())
 @click.argument("dest", type=CloudPath())
-@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
+@click.option('--queue', help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
 @click.option("--sharded", is_flag=True, default=False, help="Generate shard fragments instead of outputing mesh fragments.", show_default=True)
 @click.option("--dir", "mesh_dir", type=str, default=None, help="Write meshes into this directory instead of the one indicated in the info file.")
 @click.option('--magnitude', default=2, help="Split up the work with 10^(magnitude) prefix based tasks.", show_default=True)
@@ -924,12 +995,13 @@ def mesh_xfer(
 
 @meshgroup.command("forge")
 @click.argument("path", type=CloudPath())
-@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
+@click.option('--queue', help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
 @click.option('--mip', default=0, help="Perform meshing using this level of the image pyramid.", show_default=True)
 @click.option('--shape', type=Tuple3(), default=(448, 448, 448), help="Set the task shape in voxels.", show_default=True)
 @click.option('--simplify/--skip-simplify', is_flag=True, default=True, help="Enable mesh simplification.", show_default=True)
-@click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.")
 @click.option('--max-error', default=40, help="Maximum simplification error in physical units.", show_default=True)
+@click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.")
+@click.option('--fill-holes', type=int, default=0, help="Fill holes at different levels of aggressiveness. 0: no hole filling 1: simple hole filling 2: also fix borders 3: also morphological closing.", show_default=True)
 @click.option('--dust-threshold', default=None, help="Skip meshing objects smaller than this number of voxels within a cutout. No default limit. Typical value: 1000.", type=int)
 @click.option('--dust-global/--dust-local', is_flag=True, default=False, help="Use global voxel counts for the dust threshold (when >0). To use this feature you must first compute the global voxel counts using the 'igneous image voxels' command.", show_default=True)
 @click.option('--dir', default=None, help="Write meshes into this directory instead of the one indicated in the info file.")
@@ -937,13 +1009,14 @@ def mesh_xfer(
 @click.option('--spatial-index/--skip-spatial-index', is_flag=True, default=True, help="Create the spatial index.", show_default=True)
 @click.option('--sharded', is_flag=True, default=False, help="Generate shard fragments instead of outputing mesh fragments.", show_default=True)
 @click.option('--closed-edge/--open-edge', is_flag=True, default=True, help="Whether meshes are closed on the side that contacts the dataset boundary.", show_default=True)
+@click.option('--labels', type=ListN(), default=None, help="Mesh only this comma separated list of labels.", show_default=True)
 @click.pass_context
 def mesh_forge(
   ctx, path, queue, mip, shape, 
   simplify, fill_missing, max_error, 
   dust_threshold, dir, compress, 
   spatial_index, sharded, closed_edge,
-  dust_global
+  dust_global, labels, fill_holes,
 ):
   """
   (1) Synthesize meshes from segmentation cutouts.
@@ -953,10 +1026,11 @@ def mesh_forge(
   marching cubes and a quadratic mesh simplifier.
 
   Note that using task shapes with axes less than
-  or equal to 511x1023x511 (don't ask) will be more
+  or equal to 1023x1023x511 will be more
   memory efficient as it can use a 32-bit mesher.
 
   zmesh is used: https://github.com/seung-lab/zmesh
+  fastmorph is used for hole filling: https://github.com/seung-lab/fastmorph/
   """
   if compress.lower() == "none":
     compress = False
@@ -965,17 +1039,17 @@ def mesh_forge(
     path, mip, shape, 
     simplification=simplify, max_simplification_error=max_error,
     mesh_dir=dir, cdn_cache=False, dust_threshold=dust_threshold,
-    object_ids=None, progress=False, fill_missing=fill_missing,
+    object_ids=labels, progress=False, fill_missing=fill_missing,
     encoding='precomputed', spatial_index=spatial_index, 
     sharded=sharded, compress=compress, closed_dataset_edges=closed_edge,
-    dust_global=dust_global
+    dust_global=dust_global, fill_holes=fill_holes,
   )
 
   enqueue_tasks(ctx, queue, tasks)
 
 @meshgroup.command("merge")
 @click.argument("path", type=CloudPath())
-@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
+@click.option('--queue', help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
 @click.option('--magnitude', default=2, help="Split up the work with 10^(magnitude) prefix based tasks. Default: 2 (100 tasks)")
 @click.option('--nlod', default=0, help="(multires) How many extra levels of detail to create.", show_default=True)
 @click.option('--vqb', default=16, help="(multires) Vertex quantization bits for stored model representation. 10 or 16 only.", show_default=True)
@@ -1007,7 +1081,7 @@ def mesh_merge(ctx, path, queue, magnitude, nlod, vqb, dir, min_chunk_size):
 
 @meshgroup.command("merge-sharded")
 @click.argument("path", type=CloudPath())
-@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
+@click.option('--queue', help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
 @click.option('--nlod', default=1, help="Number of levels of detail to create.", type=int, show_default=True)
 @click.option('--vqb', default=16, help="Vertex quantization bits. Can be 10 or 16.", type=int, show_default=True)
 @click.option('--compress-level', default=7, help="Draco compression level.", type=int, show_default=True)
@@ -1056,7 +1130,7 @@ def mesh_sharded_merge(
 
 @meshgroup.command("rm")
 @click.argument("path", type=CloudPath())
-@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
+@click.option('--queue', help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
 @click.option('--magnitude', default=2, help="Split up the work with 10^(magnitude) prefix based tasks. Default: 2 (100 tasks)")
 @click.option('--dir', 'mesh_dir', default=None, help="Target this directory instead of the one indicated in the info file.")
 @click.pass_context
@@ -1105,7 +1179,7 @@ def spatialindexgroup():
 
 @spatialindexgroup.command("create")
 @click.argument("path", type=CloudPath())
-@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
+@click.option('--queue', help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
 @click.option('--shape', default="448,448,448", type=Tuple3(), help="Shape in voxels of each indexing task.", show_default=True)
 @click.option('--mip', default=0, help="Perform indexing using this level of the image pyramid.", show_default=True)
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.", show_default=True)
@@ -1172,7 +1246,8 @@ def skeletongroup():
 @click.option('--fix-branching', is_flag=True, default=True, help="Trades speed for quality of branching at forks.", show_default=True)
 @click.option('--fix-borders', is_flag=True, default=True, help="Allows trivial merging of single voxel overlap tasks. Only switch off for datasets that fit in a single task.", show_default=True)
 @click.option('--fix-avocados', is_flag=True, default=False, help="Fixes somata where nuclei and cytoplasm have separate segmentations.", show_default=True)
-@click.option('--fill-holes', is_flag=True, default=False, help="Preprocess each cutout to eliminate background holes and holes caused by entirely contained inclusions. Warning: May remove labels that are considered inclusions.", show_default=True)
+@click.option('--fix-autapses', is_flag=True, default=False, help="(graphene only) Fixes autapses by using the PyChunkGraph.", show_default=True)
+@click.option('--fill-holes', default=0, help="Preprocess each cutout to eliminate background holes and holes caused by entirely contained inclusions. Warning: May remove labels that are considered inclusions. 0: off, 1: simple fill 2: +close sides of box 3: +morphological closing", show_default=True)
 @click.option('--dust-threshold', default=1000, help="Skip skeletonizing objects smaller than this number of voxels within a cutout.", type=int, show_default=True)
 @click.option('--dust-global/--dust-local', is_flag=True, default=False, help="Use global voxel counts for the dust threshold (when >0). To use this feature you must first compute the global voxel counts using the 'igneous image voxels' command.", show_default=True)
 @click.option('--spatial-index/--skip-spatial-index', is_flag=True, default=True, help="Create the spatial index.", show_default=True)
@@ -1184,16 +1259,20 @@ def skeletongroup():
 @click.option('--soma-const', default=300, help="Const factor for soma invalidation.", type=float, show_default=True)
 @click.option('--max-paths', default=None, help="Abort skeletonizing an object after this many paths have been traced.", type=float)
 @click.option('--sharded', is_flag=True, default=False, help="Generate shard fragments instead of outputing skeleton fragments.", show_default=True)
-@click.option('--labels', type=TupleN(), default=None, help="Skeletonize only this comma separated list of labels.", show_default=True)
+@click.option('--labels', type=ListN(), default=None, help="Skeletonize only this comma separated list of labels.", show_default=True)
 @click.option('--cross-section', type=int, default=0, help="Compute the cross sectional area for each skeleton vertex. May add substantial computation time. Integer value is the normal vector rolling average smoothing window over vertices. 0 means off.", show_default=True)
+@click.option('--output', '-o', type=CloudPath(), default=None, help="Output the results to a different place.", show_default=True)
+@click.option('--timestamp', type=int, default=None, help="(graphene) Use the proofreading state at this UNIX timestamp.", show_default=True)
+@click.option('--root-ids', type=CloudPath(), default=None, help="(graphene) If you have a materialization of graphene root ids for this timepoint, it's more efficient to use it than making requests to the graphene server.", show_default=True)
+@click.option('--progress', is_flag=True, default=False, help="Print progress bars.", show_default=True)
 @click.pass_context
 def skeleton_forge(
   ctx, path, queue, mip, shape, 
   fill_missing, dust_threshold, dust_global, spatial_index,
-  fix_branching, fix_borders, fix_avocados, 
+  fix_branching, fix_borders, fix_avocados, fix_autapses,
   fill_holes, scale, const, soma_detect, soma_accept,
   soma_scale, soma_const, max_paths, sharded, labels,
-  cross_section,
+  cross_section, output, timestamp, root_ids, progress,
 ):
   """
   (1) Synthesize skeletons from segmentation cutouts.
@@ -1232,12 +1311,14 @@ def skeleton_forge(
     teasar_params=teasar_params, 
     fix_branching=fix_branching, fix_borders=fix_borders, 
     fix_avocados=fix_avocados, fill_holes=fill_holes,
-    dust_threshold=dust_threshold, progress=False,
+    dust_threshold=dust_threshold, progress=progress,
     parallel=1, fill_missing=fill_missing, 
     sharded=sharded, spatial_index=spatial_index,
     dust_global=dust_global, object_ids=labels,
     cross_sectional_area=(cross_section > 0),
     cross_sectional_area_smoothing_window=int(cross_section),
+    frag_path=output, fix_autapses=fix_autapses,
+    timestamp=timestamp, root_ids_cloudpath=root_ids,
   )
 
   enqueue_tasks(ctx, queue, tasks)
@@ -1274,7 +1355,7 @@ def skeleton_merge(
 
 @skeletongroup.command("merge-sharded")
 @click.argument("path", type=CloudPath())
-@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
+@click.option('--queue', help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
 @click.option('--min-cable-length', default=1000, help="Skip objects smaller than this physical path length.", type=float, show_default=True)
 @click.option('--max-cable-length', default=None, help="Skip objects larger than this physical path length. Default: no limit", type=float)
 @click.option('--tick-threshold', default=0, help="Remove small \"ticks\", or branches from the main skeleton one at a time from smallest to largest. Branches larger than this are preserved. Default: no elimination", type=float)
@@ -1325,7 +1406,7 @@ def skeleton_sharded_merge(
 
 @imagegroup.command("rm")
 @click.argument("path", type=CloudPath())
-@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
+@click.option('--queue', help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
 @click.option('--mip', default=0, help="Which mip level to start deleting from. Default: 0")
 @click.option('--num-mips', default=5, help="The number of mip levels to delete at once. Default: 5")
 @click.option('--shape', default=None, help="The size of each deletion task as a comma delimited list. Must be a multiple of the chunk size.", type=Tuple3())
@@ -1349,7 +1430,7 @@ def delete_images(
 
 @skeletongroup.command("rm")
 @click.argument("path", type=CloudPath())
-@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
+@click.option('--queue', help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
 @click.option('--magnitude', default=2, help="Split up the work with 10^(magnitude) prefix based tasks. Default: 2 (100 tasks)")
 @click.option('--dir', 'skel_dir', default=None, help="Target this directory instead of the one indicated in the info file.")
 @click.pass_context
@@ -1367,7 +1448,7 @@ def skeleton_rm(ctx, path, queue, magnitude, skel_dir):
 @skeletongroup.command("xfer")
 @click.argument("src", type=CloudPath())
 @click.argument("dest", type=CloudPath())
-@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
+@click.option('--queue', help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
 @click.option("--sharded", is_flag=True, default=False, help="Generate shard fragments instead of outputing mesh fragments.", show_default=True)
 @click.option("--dir", "skel_dir", type=str, default=None, help="Write skeletons into this directory instead of the one indicated in the info file.")
 @click.option('--magnitude', default=2, help="Split up the work with 10^(magnitude) prefix based tasks.", show_default=True)
@@ -1431,7 +1512,7 @@ def spatialindexgroupskel():
 
 @spatialindexgroupskel.command("create")
 @click.argument("path", type=CloudPath())
-@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
+@click.option('--queue', help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
 @click.option('--shape', default="512,512,512", type=Tuple3(), help="Shape in voxels of each indexing task.", show_default=True)
 @click.option('--mip', default=0, help="Perform indexing using this level of the image pyramid.", show_default=True)
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.", show_default=True)
@@ -1588,7 +1669,8 @@ def memory_used(data_width, shape, factor):
 @click.option('--browser/--no-browser', default=True, is_flag=True, help="Open the dataset in the system's default web browser.")
 @click.option('--port', default=1337, help="localhost server port for the file server.", show_default=True)
 @click.option('--ng', default="https://neuroglancer-demo.appspot.com/", help="Alternative Neuroglancer webpage to use.", show_default=True)
-def view(path, browser, port, ng):
+@click.option('--pos', type=Tuple3(), default=None, help="Position in volume to open to.", show_default=True)
+def view(path, browser, port, ng, pos):
   """
   Open an on-disk dataset for viewing in neuroglancer.
   """
@@ -1597,21 +1679,46 @@ void main() {
   vec3 data = vec3(toNormalized(getDataValue(0)), toNormalized(getDataValue(1)), toNormalized(getDataValue(2)));
   emitRGB(data);
 }"""
-  
   cv = CloudVolume(path)
 
   if cv.meta.path.protocol == "file":
     cloudpath = f"http://localhost:{port}"
     layer_name = "igneous"
+  elif cv.meta.path.protocol in ['matrix', 'tigerdata']:
+    cloudpath = cloudvolume.paths.to_https_protocol(cv.cloudpath)
+    layer_name = posixpath.basename(cloudpath)
   else:
     cloudpath = cv.cloudpath
     layer_name = posixpath.basename(cloudpath)
 
+  res = cv.meta.resolution(0)
+
+  dimensions = {
+    "x": [
+      res.x,
+      "nm"
+    ],
+    "y": [
+      res.y,
+      "nm"
+    ],
+    "z": [
+      res.z,
+      "nm"
+    ],
+  }
+
+  if cv.meta.path.format == "zarr":
+    dimensions["t"] = [
+      cv.meta.time_resolution_in_seconds(0), "s"
+    ]
+
   config = {
+    "dimensions": dimensions,
     "layers": [
       {
         "type": cv.layer_type,
-        "source": f"precomputed://{cloudpath}",
+        "source": f"{cv.meta.path.format}://{cloudpath}",
         "tab": "source",
         "name": layer_name
       }
@@ -1623,14 +1730,20 @@ void main() {
     "layout": "4panel"
   }
 
+  if pos:
+    x, y, z = pos
+    config["position"] = [float(x), float(y), float(z)]
+
   if cv.num_channels == 3:
     config["layers"][0]["shader"] = rgb_shader
 
-  fragment = urllib.parse.quote(json.dumps(config))
+  fragment = urllib.parse.quote(jsonify(config))
 
   url = f"{ng}#!{fragment}"
   if browser:
     webbrowser.open(url, new=2)
+  else:
+    print(url)
 
   if cv.meta.path.protocol == "file":
     cv.viewer(port=port)
@@ -1642,6 +1755,8 @@ void main() {
 @click.option('--offset', type=Tuple3(), default=(0,0,0), help="Voxel offset in x,y, and z.", show_default=True)
 @click.option('--seg', is_flag=True, default=False, help="Sets layer type to segmentation (default image).", show_default=True)
 @click.option('--encoding', type=EncodingType(), default="raw", help=ENCODING_HELP, show_default=True)
+@click.option('--encoding-level', default=None, help="For some encodings (png level, jpeg & jpeg xl quality, fpzip precision) a simple scalar value can adjust the compression efficiency.", show_default=True)
+@click.option('--encoding-effort', default=ENCODING_EFFORT, help="(JPEG XL) Set effort (1-10) used by JPEG XL to hit the quality target.", show_default=True)
 @click.option('--compress', type=CompressType(), default="br", help="Set the image compression scheme. Options: 'none', 'gzip', 'br'", show_default=True)
 @click.option('--chunk-size', type=Tuple3(), default=(128,128,64), help="Chunk size of new layers. e.g. 128,128,64", show_default=True)
 @click.option('--h5-dataset', default="main", help="Which h5 dataset to acccess (hdf5 imports only).", show_default=True)
@@ -1649,7 +1764,8 @@ void main() {
 def create(
   ctx, src, dest, 
   resolution, offset, 
-  seg, encoding,
+  seg, 
+  encoding, encoding_level, encoding_effort,
   compress, chunk_size,
   h5_dataset
 ):
@@ -1688,6 +1804,8 @@ def create(
     encoding=encoding,
     compress=compress,
     progress=True,
+    encoding_level=encoding_level,
+    encoding_effort=encoding_effort,
   )
 
 def normalize_file_ext(filename):
